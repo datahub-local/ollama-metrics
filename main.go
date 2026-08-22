@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -38,7 +39,10 @@ var (
 			// Buckets for 0.1s to 60s
 			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60},
 		},
-		[]string{"endpoint", "model"},
+		// "api_endpoint" rather than "endpoint": the Prometheus Operator stamps
+		// its own endpoint="<service port name>" label on every scraped series,
+		// which would collide and get this one renamed to "exported_endpoint".
+		[]string{"api_endpoint", "model"},
 	)
 	timePerToken = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -47,6 +51,14 @@ var (
 			Buckets: []float64{0.01, 0.05, 0.1, 0.2, 0.5, 1, 2},
 		},
 		[]string{"model"},
+	)
+	timeToFirstToken = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ollama_time_to_first_token_seconds",
+			Help:    "Time from request arrival to the first streamed content token (streaming requests only)",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120},
+		},
+		[]string{"api_endpoint", "model"},
 	)
 	loadedModelsGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -72,14 +84,17 @@ var (
 
 func init() {
 	// Register metrics with Prometheus default registry
-	prometheus.MustRegister(promptTokens, generatedTokens, requestDuration, timePerToken, loadedModelsGauge, loadedModelInfo, modelRAMUsage)
+	prometheus.MustRegister(promptTokens, generatedTokens, requestDuration, timePerToken, timeToFirstToken, loadedModelsGauge, loadedModelInfo, modelRAMUsage)
 }
 
 // Structs to parse JSON responses from Ollama
 type generateResponse struct {
-	Model              string      `json:"model"`
-	Done               *bool       `json:"done,omitempty"`
-	Response           string      `json:"response,omitempty"`
+	Model    string `json:"model"`
+	Done     *bool  `json:"done,omitempty"`
+	Response string `json:"response,omitempty"`
+	Message  *struct {
+		Content string `json:"content"`
+	} `json:"message,omitempty"`
 	PromptEvalCount    *int        `json:"prompt_eval_count,omitempty"`
 	EvalCount          *int        `json:"eval_count,omitempty"`
 	TotalDuration      *int64      `json:"total_duration,omitempty"`
@@ -88,11 +103,20 @@ type generateResponse struct {
 	DoneReason         interface{} `json:"done_reason,omitempty"`
 }
 
+// hasContent reports whether this chunk carried generated text, for either the
+// /api/generate ("response") or /api/chat ("message.content") shape.
+func (r *generateResponse) hasContent() bool {
+	if r.Response != "" {
+		return true
+	}
+	return r.Message != nil && r.Message.Content != ""
+}
+
 type psResponse struct {
 	Models []struct {
 		Name      string `json:"name"`
 		ID        string `json:"id"`
-		Size      int64  `json:"size"`      // Size in bytes
+		Size      int64  `json:"size"` // Size in bytes
 		Processor string `json:"processor"`
 		Until     string `json:"until"`
 	} `json:"models"`
@@ -117,9 +141,63 @@ type modelsResponse struct {
 	} `json:"models"`
 }
 
+type openAIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// openAIResponse covers the OpenAI-compatible shapes served on /v1: the whole
+// body of a non-streaming response, and a single "data:" event of a streamed
+// one. The three content fields are the streamed chat delta, the streamed
+// /v1/completions text, and the non-streaming chat message respectively.
+type openAIResponse struct {
+	Model   string       `json:"model"`
+	Usage   *openAIUsage `json:"usage"`
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+		Text    string `json:"text"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+func (r *openAIResponse) hasContent() bool {
+	for _, c := range r.Choices {
+		if c.Delta.Content != "" || c.Text != "" || c.Message.Content != "" {
+			return true
+		}
+	}
+	return false
+}
+
 var upstreamClient = &http.Client{
 	// No global timeout; model inference may take a long time
 	Timeout: 0,
+}
+
+// isOpenAICompletionPath reports whether a path is one of the OpenAI-compatible
+// completion endpoints, which report token usage differently from native /api.
+func isOpenAICompletionPath(path string) bool {
+	return path == "/v1/chat/completions" || path == "/v1/completions"
+}
+
+// requestHeaderBlocklist are headers we must not copy onto the upstream request.
+// Content-Length would be stale once we rewrite the body to inject
+// stream_options; Accept-Encoding would disable Go's transparent gzip
+// decompression and leave us parsing compressed bytes. The rest are hop-by-hop.
+var requestHeaderBlocklist = map[string]bool{
+	"host":              true,
+	"content-length":    true,
+	"accept-encoding":   true,
+	"connection":        true,
+	"keep-alive":        true,
+	"transfer-encoding": true,
+	"te":                true,
+	"trailer":           true,
 }
 
 // fixDoneReason processes JSON data to handle the done_reason field that might be a number or string
@@ -139,83 +217,295 @@ func ensureModelTag(modelName string) string {
 	return modelName
 }
 
-func main() {
-	// Configure upstream Ollama host and local port from environment
-	upstreamAddr := os.Getenv("OLLAMA_HOST")
-	if upstreamAddr == "" {
-		upstreamAddr = "http://localhost:11434"
+// endpointLabel turns a request path into a metric label value: "/api/chat" ->
+// "chat", "/v1/chat/completions" -> "v1/chat/completions".
+func endpointLabel(path string) string {
+	if trimmed := strings.TrimPrefix(path, "/api/"); trimmed != path {
+		return trimmed
 	}
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	if trimmed := strings.TrimPrefix(path, "/"); trimmed != "" {
+		return trimmed
 	}
+	return path
+}
 
-	log.Printf("Starting Ollama proxy sidecar, forwarding to %s", upstreamAddr)
+// parseRequestJSON decodes a JSON request body, keeping numbers as json.Number
+// so the body can be re-marshalled without mangling integer literals.
+func parseRequestJSON(body []byte) map[string]interface{} {
+	if len(body) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var parsed map[string]interface{}
+	if err := dec.Decode(&parsed); err != nil {
+		return nil
+	}
+	return parsed
+}
 
-	// Optionally, initialize the loaded models gauge at startup
-	if resp, err := upstreamClient.Get(upstreamAddr + "/api/ps"); err == nil {
-		var ps psResponse
-		data, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if jsonErr := json.Unmarshal(data, &ps); jsonErr == nil {
-			loadedModelsGauge.Set(float64(len(ps.Models)))
-			loadedModelInfo.Reset()
-			for _, m := range ps.Models {
-				loadedModelInfo.WithLabelValues(ensureModelTag(m.Name)).Set(1)
+// injectIncludeUsage rewrites a streaming /v1 request body to ask for token
+// usage, which Ollama otherwise never sends. It returns the body to forward and
+// whether the injection happened; a client that already set
+// stream_options.include_usage is forwarded untouched so its own final usage
+// chunk reaches it.
+func injectIncludeUsage(reqJSON map[string]interface{}, body []byte) ([]byte, bool) {
+	if reqJSON == nil {
+		return body, false
+	}
+	if stream, _ := reqJSON["stream"].(bool); !stream {
+		return body, false
+	}
+	opts, _ := reqJSON["stream_options"].(map[string]interface{})
+	if include, _ := opts["include_usage"].(bool); include {
+		return body, false
+	}
+	if opts == nil {
+		opts = map[string]interface{}{}
+	}
+	opts["include_usage"] = true
+	reqJSON["stream_options"] = opts
+	rewritten, err := json.Marshal(reqJSON)
+	if err != nil {
+		log.Printf("WARNING: could not inject stream_options.include_usage: %v", err)
+		return body, false
+	}
+	return rewritten, true
+}
+
+// requestStats accumulates what the metric updates need, whichever API dialect
+// the request used.
+type requestStats struct {
+	start          time.Time
+	streaming      bool
+	model          string
+	promptCount    int
+	generatedCount int
+	evalDurationNs int64 // native /api dialect only; reported by Ollama
+	firstToken     time.Time
+	lastToken      time.Time
+}
+
+// markToken records the arrival of a chunk carrying generated text, bounding the
+// generation window.
+func (s *requestStats) markToken() {
+	now := time.Now()
+	if s.firstToken.IsZero() {
+		s.firstToken = now
+	}
+	s.lastToken = now
+}
+
+// observeOpenAIUsage picks up the model name and token counts from a /v1 body or
+// stream event.
+func (s *requestStats) observeOpenAIUsage(res *openAIResponse) {
+	if res.Model != "" {
+		s.model = ensureModelTag(res.Model)
+	}
+	if res.Usage != nil {
+		s.promptCount = res.Usage.PromptTokens
+		s.generatedCount = res.Usage.CompletionTokens
+	}
+}
+
+// record emits the metrics for a finished request.
+func (s *requestStats) record(path string) {
+	if s.model == "" {
+		return
+	}
+	if s.promptCount > 0 {
+		promptTokens.WithLabelValues(s.model).Add(float64(s.promptCount))
+	}
+	if s.generatedCount > 0 {
+		generatedTokens.WithLabelValues(s.model).Add(float64(s.generatedCount))
+	}
+	endpoint := endpointLabel(path)
+	requestDuration.WithLabelValues(endpoint, s.model).Observe(time.Since(s.start).Seconds())
+	if s.streaming && !s.firstToken.IsZero() {
+		timeToFirstToken.WithLabelValues(endpoint, s.model).Observe(s.firstToken.Sub(s.start).Seconds())
+	}
+	switch {
+	case s.generatedCount > 0 && s.evalDurationNs > 0:
+		// Native dialect: Ollama reports generation time directly.
+		timePerToken.WithLabelValues(s.model).Observe(float64(s.evalDurationNs) / 1e9 / float64(s.generatedCount))
+	case s.streaming && s.generatedCount > 1 && s.lastToken.After(s.firstToken):
+		// /v1 gives no timings, so measure the generation window (first content
+		// chunk to last) ourselves. Total request duration would be dominated by
+		// prompt evaluation on large contexts and badly skew the metric, so for
+		// non-streaming /v1 we record nothing rather than a wrong number.
+		window := s.lastToken.Sub(s.firstToken).Seconds()
+		timePerToken.WithLabelValues(s.model).Observe(window / float64(s.generatedCount-1))
+	}
+}
+
+// sseData returns the payload of an SSE "data:" line.
+func sseData(line []byte) ([]byte, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return nil, false
+	}
+	return bytes.TrimSpace(trimmed[len("data:"):]), true
+}
+
+// refreshModelMetrics updates the loaded-model gauges from an /api/ps payload.
+func refreshModelMetrics(data []byte) (int, error) {
+	var ps psResponse
+	if err := json.Unmarshal(data, &ps); err != nil {
+		return 0, err
+	}
+	loadedModelsGauge.Set(float64(len(ps.Models)))
+	loadedModelInfo.Reset()
+	modelRAMUsage.Reset() // Reset RAM usage before updating
+	for _, m := range ps.Models {
+		modelName := ensureModelTag(m.Name)
+		loadedModelInfo.WithLabelValues(modelName).Set(1)
+		// Convert size from bytes to megabytes
+		modelRAMUsage.WithLabelValues(modelName).Set(float64(m.Size) / (1024 * 1024))
+	}
+	return len(ps.Models), nil
+}
+
+// streamNative forwards a native /api/generate or /api/chat response chunk by
+// chunk, buffering it for the token accounting done once the stream ends.
+func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats) bytes.Buffer {
+	var buf bytes.Buffer
+	flusher, _ := w.(http.Flusher)
+	reader := bufio.NewReader(body)
+	for {
+		// NDJSON: one JSON object per line, so line-wise forwarding reproduces
+		// the upstream bytes exactly.
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			buf.Write(line)
+			if _, writeErr := w.Write(line); writeErr != nil {
+				log.Printf("WARNING: client write error: %v", writeErr)
+				break
+			}
+			if flusher != nil {
+				flusher.Flush() // flush chunk to client
+			}
+			// Time to first token can only be seen as the chunk goes past; the
+			// token counts are parsed from the whole buffer below.
+			if st.streaming && st.firstToken.IsZero() {
+				var res generateResponse
+				if json.Unmarshal(line, &res) == nil && res.hasContent() {
+					st.markToken()
+				}
 			}
 		}
+		if readErr != nil {
+			// Break on EOF or error
+			if readErr != io.EOF {
+				log.Printf("ERROR reading upstream: %v", readErr)
+			}
+			break
+		}
 	}
+	return buf
+}
 
-	// Set up HTTP handlers
+// streamOpenAI forwards a /v1 SSE response event by event, collecting token
+// usage on the way. When dropInjectedUsage is set the usage event we asked for
+// on the client's behalf is withheld, so client-visible output is unchanged.
+func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropInjectedUsage bool) {
+	flusher, _ := w.(http.Flusher)
+	reader := bufio.NewReader(body)
+	pendingBlank := false // the blank line terminating a withheld event
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			forward := true
+			switch data, isData := sseData(line); {
+			case isData:
+				if !bytes.Equal(data, []byte("[DONE]")) {
+					var chunk openAIResponse
+					if json.Unmarshal(data, &chunk) == nil {
+						st.observeOpenAIUsage(&chunk)
+						if chunk.hasContent() {
+							st.markToken()
+						}
+						// Ollama sends usage in a final event with no choices.
+						if dropInjectedUsage && chunk.Usage != nil && len(chunk.Choices) == 0 {
+							forward = false
+						}
+					}
+				}
+				pendingBlank = !forward
+			case pendingBlank && len(bytes.TrimSpace(line)) == 0:
+				forward = false
+				pendingBlank = false
+			default:
+				pendingBlank = false
+			}
+			if forward {
+				if _, writeErr := w.Write(line); writeErr != nil {
+					log.Printf("WARNING: client write error: %v", writeErr)
+					break
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
+				log.Printf("ERROR reading upstream: %v", readErr)
+			}
+			break
+		}
+	}
+}
+
+// newMux builds the sidecar's handlers: /metrics, and a proxy for everything
+// else that forwards to upstreamAddr while accounting for token usage.
+func newMux(upstreamAddr string) *http.ServeMux {
 	mux := http.NewServeMux()
-	
+
 	// Custom metrics handler that refreshes model data before serving metrics
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		// Refresh model information from /api/ps before serving metrics
 		if resp, err := upstreamClient.Get(upstreamAddr + "/api/ps"); err == nil {
-			var ps psResponse
 			data, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if jsonErr := json.Unmarshal(data, &ps); jsonErr == nil {
-				loadedModelsGauge.Set(float64(len(ps.Models)))
-				loadedModelInfo.Reset()
-				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
-				// Update model metrics directly from ps response
-				for _, m := range ps.Models {
-					modelName := ensureModelTag(m.Name)
-					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
-					// Convert size from bytes to megabytes
-					ramMB := float64(m.Size) / (1024 * 1024)
-					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
-				}
-				log.Printf("Refreshed metrics data: %d models loaded", len(ps.Models))
+			if count, jsonErr := refreshModelMetrics(data); jsonErr == nil {
+				log.Printf("Refreshed metrics data: %d models loaded", count)
 			} else {
 				log.Printf("ERROR parsing /api/ps response during metrics refresh: %v", jsonErr)
 			}
 		} else {
 			log.Printf("ERROR refreshing model metrics: %v", err)
 		}
-		
+
 		// Serve metrics using the standard Prometheus handler
 		promhttp.Handler().ServeHTTP(w, r)
 	})
-	
+
 	// All other paths -> proxy handler
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		if r.URL.Path == "/metrics" {
-			// Should be handled above; just in case
-			promhttp.Handler().ServeHTTP(w, r)
-			return
-		}
+		st := &requestStats{start: time.Now()}
 
-		// Read request body (if any) for forwarding and possibly to inspect model parameter
+		// Read request body (if any) for forwarding and to inspect the model and
+		// streaming parameters
 		var bodyBytes []byte
 		if r.Body != nil {
 			bodyBytes, _ = io.ReadAll(r.Body)
 			r.Body.Close()
+		}
+		reqJSON := parseRequestJSON(bodyBytes)
+
+		openAIPath := isOpenAICompletionPath(r.URL.Path)
+		nativeGenerate := r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat"
+
+		forwardBody := bodyBytes
+		injectedUsage := false
+		if openAIPath {
+			forwardBody, injectedUsage = injectIncludeUsage(reqJSON, bodyBytes)
+		} else if nativeGenerate {
+			// Native endpoints stream unless the client opts out.
+			st.streaming = true
+			if stream, ok := reqJSON["stream"].(bool); ok {
+				st.streaming = stream
+			}
 		}
 
 		// Build upstream request
@@ -223,22 +513,22 @@ func main() {
 		if r.URL.RawQuery != "" {
 			targetURL += "?" + r.URL.RawQuery
 		}
-		reqUp, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyBytes))
+		reqUp, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(forwardBody))
 		if err != nil {
 			http.Error(w, "Bad request", http.StatusInternalServerError)
 			log.Printf("ERROR creating upstream request: %v", err)
 			return
 		}
-		// Copy original headers
+		// Copy original headers, minus the ones a proxy must regenerate
 		for name, vals := range r.Header {
-			if name == "Host" {
-				continue // skip Host header
+			if requestHeaderBlocklist[strings.ToLower(name)] {
+				continue
 			}
 			for _, v := range vals {
 				reqUp.Header.Add(name, v)
 			}
 		}
-		if reqUp.Header.Get("Content-Type") == "" && len(bodyBytes) > 0 {
+		if reqUp.Header.Get("Content-Type") == "" && len(forwardBody) > 0 {
 			reqUp.Header.Set("Content-Type", "application/json")
 		}
 
@@ -262,39 +552,10 @@ func main() {
 		}
 		w.WriteHeader(respUp.StatusCode)
 
-		// Variables for metrics/logging
-		var modelName string
-		var promptCount, generatedCount int
-		var evalDurationNs int64
-
-		if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
+		switch {
+		case nativeGenerate:
 			// Handle streaming JSON response for generate/chat
-			var buf bytes.Buffer
-			// MultiWriter to write to client output and buffer simultaneously
-			streamWriter := io.MultiWriter(w, &buf)
-			flusher, _ := w.(http.Flusher)
-			// Stream copy loop
-			chunk := make([]byte, 1024)
-			for {
-				n, readErr := respUp.Body.Read(chunk)
-				if n > 0 {
-					// Write chunk to both client and buffer
-					if _, writeErr := streamWriter.Write(chunk[:n]); writeErr != nil {
-						log.Printf("WARNING: client write error: %v", writeErr)
-						break
-					}
-					if flusher != nil {
-						flusher.Flush() // flush chunk to client
-					}
-				}
-				if readErr != nil {
-					// Break on EOF or error
-					if readErr != io.EOF {
-						log.Printf("ERROR reading upstream: %v", readErr)
-					}
-					break
-				}
-			}
+			buf := streamNative(w, respUp.Body, st)
 
 			// Fix the JSON before parsing
 			bufData := fixDoneReason(buf.Bytes())
@@ -304,8 +565,8 @@ func main() {
 			if err := json.Unmarshal(bufData, &modelsResp); err == nil && len(modelsResp.Models) > 0 {
 				// This is a models list response, not a typical generate response
 				for _, model := range modelsResp.Models {
-					modelName = ensureModelTag(model.Model)
-					modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
+					st.model = ensureModelTag(model.Model)
+					modelRAMUsage.WithLabelValues(st.model).Set(float64(model.SizeVRAM) / (1024 * 1024))
 				}
 				log.Printf("Received models list response with %d models", len(modelsResp.Models))
 				// No token counts for models list response
@@ -323,98 +584,100 @@ func main() {
 					}
 
 					if res.Model != "" {
-						modelName = ensureModelTag(res.Model)
+						st.model = ensureModelTag(res.Model)
 					}
 
 					// If this chunk signals done, capture metrics fields
 					if res.Done != nil && *res.Done {
 						if res.PromptEvalCount != nil {
-							promptCount = *res.PromptEvalCount
+							st.promptCount = *res.PromptEvalCount
 						}
 						if res.EvalCount != nil {
-							generatedCount = *res.EvalCount
+							st.generatedCount = *res.EvalCount
 						}
 						if res.EvalDuration != nil {
-							evalDurationNs = *res.EvalDuration
+							st.evalDurationNs = *res.EvalDuration
 						}
 					}
 				}
 			}
-		} else if r.URL.Path == "/api/ps" {
+		case r.URL.Path == "/api/ps":
 			// Intercept /api/ps to update loaded models metrics
 			bodyData, _ := io.ReadAll(respUp.Body)
 			w.Write(bodyData) // write response to client
-			var ps psResponse
-			if err := json.Unmarshal(bodyData, &ps); err == nil {
-				loadedModelsGauge.Set(float64(len(ps.Models)))
-				loadedModelInfo.Reset()
-				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
-				// Update model metrics directly from ps response
-				for _, m := range ps.Models {
-					modelName := ensureModelTag(m.Name)
-					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
-						// Convert size from bytes to megabytes
-					ramMB := float64(m.Size) / (1024 * 1024)
-					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
-					log.Printf("Model %s RAM usage: %.2f MB", modelName, ramMB)
-				}
+			if count, err := refreshModelMetrics(bodyData); err == nil {
+				log.Printf("Refreshed metrics data: %d models loaded", count)
 			} else {
 				log.Printf("ERROR parsing /api/ps response: %v", err)
 			}
 			// We can return here since request is fully handled
 			return
-		} else {
+		case openAIPath:
+			// Trust the response, not the request, about whether this streamed:
+			// an upstream error to a stream:true request is a plain JSON body.
+			st.streaming = strings.HasPrefix(respUp.Header.Get("Content-Type"), "text/event-stream")
+			if st.streaming {
+				streamOpenAI(w, respUp.Body, st, injectedUsage)
+			} else {
+				// Non-streaming /v1 always carries a usage object.
+				bodyData, _ := io.ReadAll(respUp.Body)
+				w.Write(bodyData)
+				var res openAIResponse
+				if err := json.Unmarshal(bodyData, &res); err == nil {
+					st.observeOpenAIUsage(&res)
+				} else {
+					log.Printf("WARNING: Failed to parse %s response: %v", r.URL.Path, err)
+				}
+			}
+		default:
 			// Other endpoints (e.g. /api/tags, /api/pull) - just copy through
 			io.Copy(w, respUp.Body)
 			// Try to get model name from request (if JSON body has "model")
-			if len(bodyBytes) > 0 {
-				var reqJson map[string]interface{}
-				if err := json.Unmarshal(bodyBytes, &reqJson); err == nil {
-					if m, ok := reqJson["model"].(string); ok {
-						modelName = ensureModelTag(m)
-					}
-				}
+			if m, ok := reqJSON["model"].(string); ok {
+				st.model = ensureModelTag(m)
 			}
 			// No token metrics for non-generate endpoints
 		}
 
-		// Update Prometheus metrics if applicable
-		if modelName != "" {
-			if promptCount > 0 {
-				promptTokens.WithLabelValues(modelName).Add(float64(promptCount))
-			}
-			if generatedCount > 0 {
-				generatedTokens.WithLabelValues(modelName).Add(float64(generatedCount))
-			}
-			durationSec := time.Since(start).Seconds()
-			endpoint := strings.TrimPrefix(r.URL.Path, "/api/")
-			if endpoint == "" {
-				endpoint = r.URL.Path
-			}
-			requestDuration.WithLabelValues(endpoint, modelName).Observe(durationSec)
-			if generatedCount > 0 && evalDurationNs > 0 {
-				// evalDurationNs is in nanoseconds
-				secondsPerToken := float64(evalDurationNs) / 1e9 / float64(generatedCount)
-				timePerToken.WithLabelValues(modelName).Observe(secondsPerToken)
-			}
-			// Removed the redundant /api/ps call for /api/generate and /api/chat endpoints
-			// Model metrics are now refreshed on every /metrics request
-		}
+		st.record(r.URL.Path)
 
 		// Logging
-		duration := time.Since(start).Seconds()
-		if modelName != "" && (promptCount > 0 || generatedCount > 0) {
+		duration := time.Since(st.start).Seconds()
+		if st.model != "" && (st.promptCount > 0 || st.generatedCount > 0) {
 			log.Printf("%s %s -> model=%s prompt_tokens=%d generated_tokens=%d duration=%.2fs",
-				r.Method, r.URL.Path, modelName, promptCount, generatedCount, duration)
+				r.Method, r.URL.Path, st.model, st.promptCount, st.generatedCount, duration)
 		} else {
 			log.Printf("%s %s -> status=%d duration=%.2fs", r.Method, r.URL.Path, respUp.StatusCode, duration)
 		}
 	})
 
+	return mux
+}
+
+func main() {
+	// Configure upstream Ollama host and local port from environment
+	upstreamAddr := os.Getenv("OLLAMA_HOST")
+	if upstreamAddr == "" {
+		upstreamAddr = "http://localhost:11434"
+	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Starting Ollama proxy sidecar, forwarding to %s", upstreamAddr)
+
+	// Optionally, initialize the loaded models gauge at startup
+	if resp, err := upstreamClient.Get(upstreamAddr + "/api/ps"); err == nil {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if _, err := refreshModelMetrics(data); err != nil {
+			log.Printf("ERROR parsing /api/ps response at startup: %v", err)
+		}
+	}
+
 	// Start HTTP server
 	listenAddr := ":" + port
 	log.Printf("Listening on %s", listenAddr)
-	log.Fatal(http.ListenAndServe(listenAddr, mux))
+	log.Fatal(http.ListenAndServe(listenAddr, newMux(upstreamAddr)))
 }

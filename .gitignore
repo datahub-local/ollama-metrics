@@ -1,2 +1,6 @@
 __debug_**
 .DS_Store
+# Build artifacts: `go build ./...` names the binary after the module path's
+# last element ("m"), `go build -o` after the flag.
+/m
+/ollama-metrics
