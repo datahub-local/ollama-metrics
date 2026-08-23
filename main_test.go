@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // The stub upstream reports these token counts for every request, whichever
@@ -641,5 +642,90 @@ func TestInjectIncludeUsage(t *testing.T) {
 				t.Errorf("rewritten body does not set include_usage: %s", got)
 			}
 		})
+	}
+}
+
+// TestSanitizeUTF8 covers the repair itself. The point is not tidiness: an
+// invalid byte in a reply costs the whole report downstream, because
+// Sympozium's runner ships it to its controller over gRPC and protobuf refuses
+// to marshal a string field that is not valid UTF-8 - dropping the result while
+// the run still reports success.
+func TestSanitizeUTF8(t *testing.T) {
+	valid := []byte(`{"content":"SRE Sentinel · homelab 中文 ✓"}`)
+	if got := sanitizeUTF8(valid); !bytes.Equal(got, valid) {
+		t.Errorf("valid input was modified:\n got: %q\nwant: %q", got, valid)
+	}
+	// The fast path must not allocate a copy for the common case.
+	if got := sanitizeUTF8(valid); &got[0] != &valid[0] {
+		t.Error("valid input was copied; expected the same backing array")
+	}
+
+	for _, tc := range []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		// A lone continuation byte: what a truncated multi-byte emit looks like.
+		{"lone continuation", []byte{'a', 0xb7, 'b'}, "a�b"},
+		// A lead byte with its continuation missing - the U+00B7 case that
+		// actually happened, where the model emitted half of "\xc2\xb7".
+		{"truncated lead", []byte{'a', 0xc2, 'b'}, "a�b"},
+		// Surrounding valid multi-byte text must survive intact.
+		{"keeps neighbours", []byte("中\xff·"), "中�·"},
+		{"trailing lead byte", []byte{'x', 0xe4}, "x�"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(sanitizeUTF8(tc.in))
+			if got != tc.want {
+				t.Errorf("sanitizeUTF8(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("output is still not valid UTF-8: %q", got)
+			}
+		})
+	}
+}
+
+// TestInvalidUTF8IsRepairedInFlight drives a real /api/chat stream whose upstream
+// emits a broken byte, and checks the client sees valid UTF-8 with the
+// surrounding characters untouched. Uses its own upstream rather than the shared
+// stub, which only ever serves well-formed bodies.
+func TestInvalidUTF8IsRepairedInFlight(t *testing.T) {
+	line := append([]byte(`{"model":"m","message":{"role":"assistant","content":"ok `), 0xc2)
+	line = append(line, []byte(` · end"},"done":false}`+"\n")...)
+	done := []byte(`{"model":"m","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1,"eval_duration":1000000}` + "\n")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Write(line)
+		w.Write(done)
+	}))
+	defer upstream.Close()
+
+	proxy := httptest.NewServer(newMux(upstream.URL))
+	defer proxy.Close()
+
+	res, err := http.Post(proxy.URL+"/api/chat", "application/json",
+		strings.NewReader(`{"model":"m","messages":[],"stream":true}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer res.Body.Close()
+	got, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if !utf8.Valid(got) {
+		t.Fatalf("client still received invalid UTF-8: %q", got)
+	}
+	if !strings.Contains(string(got), "�") {
+		t.Errorf("expected the bad byte replaced by U+FFFD, got %q", got)
+	}
+	// The characters either side of the damage must be intact.
+	for _, want := range []string{"ok ", " · end", `"done":true`} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("lost %q from the stream: %q", want, got)
+		}
 	}
 }

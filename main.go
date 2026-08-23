@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -206,6 +207,29 @@ func fixDoneReason(data []byte) []byte {
 	return re.ReplaceAll(data, []byte(`"done_reason":"$1"`))
 }
 
+// sanitizeUTF8 replaces invalid UTF-8 byte sequences with U+FFFD.
+//
+// A model can emit a broken multi-byte sequence, and downstream that is not a
+// cosmetic problem: Sympozium's agent-runner ships the reply to its controller
+// over gRPC, protobuf refuses to marshal a string field that is not valid UTF-8,
+// and the whole result is dropped while the run still reports success. One
+// corrupt byte costs the entire report. Replacing it costs one character.
+//
+// Doing this per line is safe because both response dialects are newline
+// framed - NDJSON for /api/*, SSE for /v1/* - and a newline (0x0A) can never
+// appear inside a multi-byte sequence, whose bytes are all >= 0x80. So a line
+// boundary never splits a character, and sanitizing a line in isolation cannot
+// corrupt one that merely spans two reads.
+//
+// The utf8.Valid check is the fast path: the overwhelming majority of lines are
+// already valid and are returned untouched, without allocating.
+func sanitizeUTF8(line []byte) []byte {
+	if utf8.Valid(line) {
+		return line
+	}
+	return bytes.ToValidUTF8(line, []byte("\uFFFD"))
+}
+
 // ensureModelTag adds ":latest" to model names that don't have a tag
 func ensureModelTag(modelName string) string {
 	if modelName == "" {
@@ -373,9 +397,11 @@ func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats) bytes
 	reader := bufio.NewReader(body)
 	for {
 		// NDJSON: one JSON object per line, so line-wise forwarding reproduces
-		// the upstream bytes exactly.
+		// the upstream bytes exactly, save for invalid UTF-8 - see sanitizeUTF8
+		// for why that is repaired here and why per-line is safe.
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			line = sanitizeUTF8(line)
 			buf.Write(line)
 			if _, writeErr := w.Write(line); writeErr != nil {
 				log.Printf("WARNING: client write error: %v", writeErr)
@@ -414,6 +440,7 @@ func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropI
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			line = sanitizeUTF8(line)
 			forward := true
 			switch data, isData := sseData(line); {
 			case isData:
@@ -621,6 +648,7 @@ func newMux(upstreamAddr string) *http.ServeMux {
 			} else {
 				// Non-streaming /v1 always carries a usage object.
 				bodyData, _ := io.ReadAll(respUp.Body)
+				bodyData = sanitizeUTF8(bodyData)
 				w.Write(bodyData)
 				var res openAIResponse
 				if err := json.Unmarshal(bodyData, &res); err == nil {
