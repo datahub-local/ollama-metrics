@@ -406,7 +406,7 @@ func refreshModelMetrics(data []byte) (int, error) {
 
 // streamNative forwards a native /api/generate or /api/chat response chunk by
 // chunk, buffering it for the token accounting done once the stream ends.
-func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats) bytes.Buffer {
+func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats, method, path string) bytes.Buffer {
 	var buf bytes.Buffer
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(body)
@@ -418,7 +418,7 @@ func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats) bytes
 		if len(line) > 0 {
 			line = sanitizeUTF8(line)
 			buf.Write(line)
-			logDebugBody("output", "", "", line)
+			logDebugBody("output", method, path, line)
 			if _, writeErr := w.Write(line); writeErr != nil {
 				log.Printf("WARNING: client write error: %v", writeErr)
 				break
@@ -449,7 +449,7 @@ func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats) bytes
 // streamOpenAI forwards a /v1 SSE response event by event, collecting token
 // usage on the way. When dropInjectedUsage is set the usage event we asked for
 // on the client's behalf is withheld, so client-visible output is unchanged.
-func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropInjectedUsage bool) {
+func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropInjectedUsage bool, method, path string) {
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(body)
 	pendingBlank := false // the blank line terminating a withheld event
@@ -457,6 +457,8 @@ func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropI
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			line = sanitizeUTF8(line)
+			// Log every upstream line, including usage events withheld from the client.
+			logDebugBody("output", method, path, line)
 			forward := true
 			switch data, isData := sseData(line); {
 			case isData:
@@ -481,7 +483,6 @@ func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropI
 				pendingBlank = false
 			}
 			if forward {
-				logDebugBody("output", "", "", line)
 				if _, writeErr := w.Write(line); writeErr != nil {
 					log.Printf("WARNING: client write error: %v", writeErr)
 					break
@@ -600,7 +601,7 @@ func newMux(upstreamAddr string) *http.ServeMux {
 		switch {
 		case nativeGenerate:
 			// Handle streaming JSON response for generate/chat
-			buf := streamNative(w, respUp.Body, st)
+			buf := streamNative(w, respUp.Body, st, r.Method, r.URL.Path)
 
 			// Fix the JSON before parsing
 			bufData := fixDoneReason(buf.Bytes())
@@ -663,7 +664,7 @@ func newMux(upstreamAddr string) *http.ServeMux {
 			// an upstream error to a stream:true request is a plain JSON body.
 			st.streaming = strings.HasPrefix(respUp.Header.Get("Content-Type"), "text/event-stream")
 			if st.streaming {
-				streamOpenAI(w, respUp.Body, st, injectedUsage)
+				streamOpenAI(w, respUp.Body, st, injectedUsage, r.Method, r.URL.Path)
 			} else {
 				// Non-streaming /v1 always carries a usage object.
 				bodyData, _ := io.ReadAll(respUp.Body)
