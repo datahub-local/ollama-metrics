@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -178,6 +179,20 @@ func (r *openAIResponse) hasContent() bool {
 var upstreamClient = &http.Client{
 	// No global timeout; model inference may take a long time
 	Timeout: 0,
+}
+
+// debugModeEnabled reports whether request and response bodies should be
+// logged. The value is read when handling a request so tests and long-running
+// processes can change DEBUG_MODE without restarting the sidecar.
+func debugModeEnabled() bool {
+	enabled, err := strconv.ParseBool(os.Getenv("DEBUG_MODE"))
+	return err == nil && enabled
+}
+
+func logDebugBody(direction, method, path string, body []byte) {
+	if debugModeEnabled() {
+		log.Printf("DEBUG %s %s %s body=%q", direction, method, path, body)
+	}
 }
 
 // isOpenAICompletionPath reports whether a path is one of the OpenAI-compatible
@@ -403,6 +418,7 @@ func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats) bytes
 		if len(line) > 0 {
 			line = sanitizeUTF8(line)
 			buf.Write(line)
+			logDebugBody("output", "", "", line)
 			if _, writeErr := w.Write(line); writeErr != nil {
 				log.Printf("WARNING: client write error: %v", writeErr)
 				break
@@ -465,6 +481,7 @@ func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropI
 				pendingBlank = false
 			}
 			if forward {
+				logDebugBody("output", "", "", line)
 				if _, writeErr := w.Write(line); writeErr != nil {
 					log.Printf("WARNING: client write error: %v", writeErr)
 					break
@@ -518,6 +535,7 @@ func newMux(upstreamAddr string) *http.ServeMux {
 			bodyBytes, _ = io.ReadAll(r.Body)
 			r.Body.Close()
 		}
+		logDebugBody("input", r.Method, r.URL.Path, bodyBytes)
 		reqJSON := parseRequestJSON(bodyBytes)
 
 		openAIPath := isOpenAICompletionPath(r.URL.Path)
@@ -631,6 +649,7 @@ func newMux(upstreamAddr string) *http.ServeMux {
 		case r.URL.Path == "/api/ps":
 			// Intercept /api/ps to update loaded models metrics
 			bodyData, _ := io.ReadAll(respUp.Body)
+			logDebugBody("output", r.Method, r.URL.Path, bodyData)
 			w.Write(bodyData) // write response to client
 			if count, err := refreshModelMetrics(bodyData); err == nil {
 				log.Printf("Refreshed metrics data: %d models loaded", count)
@@ -649,6 +668,7 @@ func newMux(upstreamAddr string) *http.ServeMux {
 				// Non-streaming /v1 always carries a usage object.
 				bodyData, _ := io.ReadAll(respUp.Body)
 				bodyData = sanitizeUTF8(bodyData)
+				logDebugBody("output", r.Method, r.URL.Path, bodyData)
 				w.Write(bodyData)
 				var res openAIResponse
 				if err := json.Unmarshal(bodyData, &res); err == nil {
@@ -659,7 +679,13 @@ func newMux(upstreamAddr string) *http.ServeMux {
 			}
 		default:
 			// Other endpoints (e.g. /api/tags, /api/pull) - just copy through
-			io.Copy(w, respUp.Body)
+			if debugModeEnabled() {
+				bodyData, _ := io.ReadAll(respUp.Body)
+				logDebugBody("output", r.Method, r.URL.Path, bodyData)
+				_, _ = w.Write(bodyData)
+			} else {
+				_, _ = io.Copy(w, respUp.Body)
+			}
 			// Try to get model name from request (if JSON body has "model")
 			if m, ok := reqJSON["model"].(string); ok {
 				st.model = ensureModelTag(m)
@@ -694,6 +720,7 @@ func main() {
 	}
 
 	log.Printf("Starting Ollama proxy sidecar, forwarding to %s", upstreamAddr)
+	log.Printf("Debug body logging enabled: %t", debugModeEnabled())
 
 	// Optionally, initialize the loaded models gauge at startup
 	if resp, err := upstreamClient.Get(upstreamAddr + "/api/ps"); err == nil {
