@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -280,7 +281,38 @@ func parseRequestJSON(body []byte) map[string]interface{} {
 	if err := dec.Decode(&parsed); err != nil {
 		return nil
 	}
+	var extra interface{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil
+	}
 	return parsed
+}
+
+// parseRequestOverrides reads the process-wide request override configuration.
+// It is called once when the proxy is constructed, rather than per request.
+func parseRequestOverrides() (map[string]interface{}, error) {
+	raw := os.Getenv("OLLAMA_PROXY_REQUEST_OVERRIDES")
+	if raw == "" {
+		return map[string]interface{}{}, nil
+	}
+	parsed := parseRequestJSON([]byte(raw))
+	if parsed == nil {
+		return nil, fmt.Errorf("OLLAMA_PROXY_REQUEST_OVERRIDES must be a valid JSON object")
+	}
+	return parsed, nil
+}
+
+// applyRequestOverrides merges configured values over a client request while
+// preserving json.Number values when the rewritten body is marshalled.
+func applyRequestOverrides(reqJSON, overrides map[string]interface{}) ([]byte, error) {
+	merged := make(map[string]interface{}, len(reqJSON)+len(overrides))
+	for key, value := range reqJSON {
+		merged[key] = value
+	}
+	for key, value := range overrides {
+		merged[key] = value
+	}
+	return json.Marshal(merged)
 }
 
 // injectIncludeUsage rewrites a streaming /v1 request body to ask for token
@@ -503,7 +535,7 @@ func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropI
 
 // newMux builds the sidecar's handlers: /metrics, and a proxy for everything
 // else that forwards to upstreamAddr while accounting for token usage.
-func newMux(upstreamAddr string) *http.ServeMux {
+func newMuxWithOverrides(upstreamAddr string, requestOverrides map[string]interface{}) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Custom metrics handler that refreshes model data before serving metrics
@@ -544,8 +576,21 @@ func newMux(upstreamAddr string) *http.ServeMux {
 
 		forwardBody := bodyBytes
 		injectedUsage := false
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+			if reqJSON == nil {
+				http.Error(w, "malformed JSON request body", http.StatusBadRequest)
+				return
+			}
+			var rewriteErr error
+			forwardBody, rewriteErr = applyRequestOverrides(reqJSON, requestOverrides)
+			if rewriteErr != nil {
+				http.Error(w, "could not rewrite JSON request body", http.StatusBadRequest)
+				return
+			}
+			reqJSON = parseRequestJSON(forwardBody)
+		}
 		if openAIPath {
-			forwardBody, injectedUsage = injectIncludeUsage(reqJSON, bodyBytes)
+			forwardBody, injectedUsage = injectIncludeUsage(reqJSON, forwardBody)
 		} else if nativeGenerate {
 			// Native endpoints stream unless the client opts out.
 			st.streaming = true
@@ -709,6 +754,15 @@ func newMux(upstreamAddr string) *http.ServeMux {
 	return mux
 }
 
+// newMux parses environment configuration once for direct proxy construction.
+func newMux(upstreamAddr string) *http.ServeMux {
+	overrides, err := parseRequestOverrides()
+	if err != nil {
+		panic(err)
+	}
+	return newMuxWithOverrides(upstreamAddr, overrides)
+}
+
 func main() {
 	// Configure upstream Ollama host and local port from environment
 	upstreamAddr := os.Getenv("OLLAMA_HOST")
@@ -732,8 +786,13 @@ func main() {
 		}
 	}
 
+	requestOverrides, err := parseRequestOverrides()
+	if err != nil {
+		log.Fatalf("Invalid OLLAMA_PROXY_REQUEST_OVERRIDES: %v", err)
+	}
+
 	// Start HTTP server
 	listenAddr := ":" + port
 	log.Printf("Listening on %s", listenAddr)
-	log.Fatal(http.ListenAndServe(listenAddr, newMux(upstreamAddr)))
+	log.Fatal(http.ListenAndServe(listenAddr, newMuxWithOverrides(upstreamAddr, requestOverrides)))
 }

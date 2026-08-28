@@ -219,6 +219,96 @@ func newProxy(t *testing.T) (*httptest.Server, *stubUpstream) {
 	return proxy, stub
 }
 
+func newProxyWithOverrides(t *testing.T, overrides map[string]interface{}) (*httptest.Server, *stubUpstream) {
+	t.Helper()
+	stub := newStubUpstream(t)
+	proxy := httptest.NewServer(newMuxWithOverrides(stub.URL, overrides))
+	t.Cleanup(proxy.Close)
+	return proxy, stub
+}
+
+func TestRequestOverridesConfiguration(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		t.Setenv("OLLAMA_PROXY_REQUEST_OVERRIDES", "")
+		got, err := parseRequestOverrides()
+		if err != nil || len(got) != 0 {
+			t.Fatalf("parseRequestOverrides() = %#v, %v; want empty object", got, err)
+		}
+	})
+	t.Run("valid object", func(t *testing.T) {
+		t.Setenv("OLLAMA_PROXY_REQUEST_OVERRIDES", `{"reasoning_effort":"none","temperature":0}`)
+		got, err := parseRequestOverrides()
+		if err != nil || got["reasoning_effort"] != "none" {
+			t.Fatalf("parseRequestOverrides() = %#v, %v", got, err)
+		}
+	})
+	for _, value := range []string{"not json", `[]`, `null`} {
+		t.Run("invalid "+value, func(t *testing.T) {
+			t.Setenv("OLLAMA_PROXY_REQUEST_OVERRIDES", value)
+			if _, err := parseRequestOverrides(); err == nil {
+				t.Fatal("parseRequestOverrides() succeeded; want an error")
+			}
+		})
+	}
+}
+
+func TestRequestOverridesClientValuesAndFields(t *testing.T) {
+	proxy, stub := newProxyWithOverrides(t, map[string]interface{}{
+		"reasoning_effort": "none",
+		"temperature":      float64(0),
+	})
+	body := `{"model":"override-model","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function"}],"stream":false,"temperature":0.9}`
+	post(t, proxy, "/v1/chat/completions", body, http.Header{"X-Test": []string{"preserve-me"}})
+	up := stub.lastRequest(t, "/v1/chat/completions")
+	var got map[string]interface{}
+	if err := json.Unmarshal(up.body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["reasoning_effort"] != "none" || got["temperature"] != float64(0) {
+		t.Errorf("overrides not applied: %s", up.body)
+	}
+	for _, key := range []string{"model", "messages", "tools", "stream"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("unrelated field %q was lost: %s", key, up.body)
+		}
+	}
+	if up.header.Get("X-Test") != "preserve-me" {
+		t.Errorf("header was not preserved: %v", up.header)
+	}
+}
+
+func TestMalformedChatRequestIsRejected(t *testing.T) {
+	proxy, stub := newProxyWithOverrides(t, map[string]interface{}{"reasoning_effort": "none"})
+	resp, err := proxy.Client().Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	for _, request := range stub.requests {
+		if request.path == "/v1/chat/completions" {
+			t.Fatal("malformed request reached upstream")
+		}
+	}
+}
+
+func TestRequestOverridesDoNotAffectOtherEndpoints(t *testing.T) {
+	proxy, stub := newProxyWithOverrides(t, map[string]interface{}{"reasoning_effort": "none"})
+	nativeBody := `{"model":"native","messages":[],"stream":false}`
+	post(t, proxy, "/api/chat", nativeBody, nil)
+	post(t, proxy, "/v1/completions", `{"model":"legacy","prompt":"hi"}`, nil)
+	for _, path := range []string{"/api/chat", "/v1/completions"} {
+		up := stub.lastRequest(t, path)
+		if strings.Contains(string(up.body), "reasoning_effort") {
+			t.Errorf("override leaked into %s: %s", path, up.body)
+		}
+	}
+}
+
 // post sends a request through the proxy and returns the client-visible body.
 func post(t *testing.T, proxy *httptest.Server, path, body string, header http.Header) string {
 	t.Helper()

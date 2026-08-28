@@ -36,12 +36,14 @@ proxied through unchanged, with request duration recorded.
 - `OLLAMA_HOST` - Ollama host address (default: `http://localhost:11434`)
 - `PORT` - Port to run the metrics server on (default: `8080`)
 - `DEBUG_MODE` - Set to `true` to log request input and response output bodies (default: disabled)
+- `OLLAMA_PROXY_REQUEST_OVERRIDES` - JSON object merged over `POST /v1/chat/completions` requests (default: `{}`); configured values override client values.
 
 ### Docker
 
 ```bash
 docker run -d --name ollama-metrics \
   -e OLLAMA_HOST=http://ollama:11434 \
+  -e 'OLLAMA_PROXY_REQUEST_OVERRIDES={"reasoning_effort":"none"}' \
   -p 8080:8080 \
   ghcr.io/norskhelsenett/ollama-metrics:latest
 ```
