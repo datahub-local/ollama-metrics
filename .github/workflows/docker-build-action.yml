@@ -7,6 +7,12 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+# The image is named after the product, not the repository. Change it here and
+# every reference below - build tags and the retention prune - follows.
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ollama-proxy
+
 jobs:
   docker-build-action:
     runs-on: ubuntu-latest
@@ -26,13 +32,17 @@ jobs:
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set release tag as current date
+      - name: Set image reference and release tag
         id: tag
-        run: echo "RELEASE_TAG=v$(date +'%Y%m%d%H%M')" >> $GITHUB_ENV
+        run: |
+          # The owner is lowercased because registry references must be, while
+          # GITHUB_REPOSITORY_OWNER preserves the account's original casing.
+          echo "IMAGE_REF=${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> $GITHUB_ENV
+          echo "RELEASE_TAG=v$(date +'%Y%m%d%H%M')" >> $GITHUB_ENV
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -41,8 +51,8 @@ jobs:
           push: true
           pull: true
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
+            ${{ env.IMAGE_REF }}:latest
+            ${{ env.IMAGE_REF }}:${{ env.RELEASE_TAG }}
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -50,7 +60,9 @@ jobs:
         uses: dataaxiom/ghcr-cleanup-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
+          # Without this the action falls back to the repository name, which is
+          # no longer what the image is called.
+          package: ${{ env.IMAGE_NAME }}
           dry-run: false
           delete-untagged: true
           delete-ghost-images: true
