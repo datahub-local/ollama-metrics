@@ -288,24 +288,56 @@ func parseRequestJSON(body []byte) map[string]interface{} {
 	return parsed
 }
 
-// parseRequestOverrides reads the process-wide request override configuration.
-// It is called once when the proxy is constructed, rather than per request.
-func parseRequestOverrides() (map[string]interface{}, error) {
-	raw := os.Getenv("OLLAMA_PROXY_REQUEST_OVERRIDES")
+// parseRequestValues reads one process-wide JSON request configuration value.
+func parseRequestValues(envVar string) (map[string]interface{}, error) {
+	raw := os.Getenv(envVar)
 	if raw == "" {
 		return map[string]interface{}{}, nil
 	}
 	parsed := parseRequestJSON([]byte(raw))
 	if parsed == nil {
-		return nil, fmt.Errorf("OLLAMA_PROXY_REQUEST_OVERRIDES must be a valid JSON object")
+		return nil, fmt.Errorf("%s must be a valid JSON object", envVar)
 	}
 	return parsed, nil
 }
 
-// applyRequestOverrides merges configured values over a client request while
-// preserving json.Number values when the rewritten body is marshalled.
-func applyRequestOverrides(reqJSON, overrides map[string]interface{}) ([]byte, error) {
-	merged := make(map[string]interface{}, len(reqJSON)+len(overrides))
+// parseRequestOverrides reads values that always win over client values.
+func parseRequestOverrides() (map[string]interface{}, error) {
+	return parseRequestValues("OLLAMA_PROXY_REQUEST_OVERRIDES")
+}
+
+// parseRequestDefaults reads values that are only used when the client omitted
+// them, allowing clients to opt out by supplying their own value.
+func parseRequestDefaults() (map[string]interface{}, error) {
+	return parseRequestValues("OLLAMA_PROXY_REQUEST_DEFAULTS")
+}
+
+// sanitizeUTF8ResponsesEnabled reports whether invalid UTF-8 in upstream
+// responses should be repaired. It defaults to true so broken model output
+// cannot make downstream protobuf/gRPC messages unmarshalable, and an
+// unparseable value keeps that default rather than silently switching the
+// protection off: disabling it is a deliberate choice, never a typo.
+func sanitizeUTF8ResponsesEnabled() bool {
+	raw := os.Getenv("OLLAMA_SANITIZE_UTF8_RESPONSE")
+	if raw == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		log.Printf("WARNING: ignoring unparseable OLLAMA_SANITIZE_UTF8_RESPONSE=%q; keeping sanitization enabled", raw)
+		return true
+	}
+	return enabled
+}
+
+// applyRequestOverrides merges defaults under client values and overrides over
+// them, while preserving json.Number values when the rewritten body is
+// marshalled.
+func applyRequestOverrides(reqJSON, defaults, overrides map[string]interface{}) ([]byte, error) {
+	merged := make(map[string]interface{}, len(reqJSON)+len(defaults)+len(overrides))
+	for key, value := range defaults {
+		merged[key] = value
+	}
 	for key, value := range reqJSON {
 		merged[key] = value
 	}
@@ -438,7 +470,7 @@ func refreshModelMetrics(data []byte) (int, error) {
 
 // streamNative forwards a native /api/generate or /api/chat response chunk by
 // chunk, buffering it for the token accounting done once the stream ends.
-func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats, method, path string) bytes.Buffer {
+func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats, sanitizeUTF8Responses bool, method, path string) bytes.Buffer {
 	var buf bytes.Buffer
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(body)
@@ -448,7 +480,9 @@ func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats, metho
 		// for why that is repaired here and why per-line is safe.
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			line = sanitizeUTF8(line)
+			if sanitizeUTF8Responses {
+				line = sanitizeUTF8(line)
+			}
 			buf.Write(line)
 			logDebugBody("output", method, path, line)
 			if _, writeErr := w.Write(line); writeErr != nil {
@@ -481,14 +515,16 @@ func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats, metho
 // streamOpenAI forwards a /v1 SSE response event by event, collecting token
 // usage on the way. When dropInjectedUsage is set the usage event we asked for
 // on the client's behalf is withheld, so client-visible output is unchanged.
-func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropInjectedUsage bool, method, path string) {
+func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropInjectedUsage, sanitizeUTF8Responses bool, method, path string) {
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(body)
 	pendingBlank := false // the blank line terminating a withheld event
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			line = sanitizeUTF8(line)
+			if sanitizeUTF8Responses {
+				line = sanitizeUTF8(line)
+			}
 			// Log every upstream line, including usage events withheld from the client.
 			logDebugBody("output", method, path, line)
 			forward := true
@@ -533,9 +569,9 @@ func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropI
 	}
 }
 
-// newMux builds the sidecar's handlers: /metrics, and a proxy for everything
-// else that forwards to upstreamAddr while accounting for token usage.
-func newMuxWithOverrides(upstreamAddr string, requestOverrides map[string]interface{}) *http.ServeMux {
+// newMuxWithConfig builds the sidecar's handlers: /metrics, and a proxy for
+// everything else that forwards to upstreamAddr while accounting for token usage.
+func newMuxWithConfig(upstreamAddr string, requestDefaults, requestOverrides map[string]interface{}, sanitizeUTF8Responses bool) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Custom metrics handler that refreshes model data before serving metrics
@@ -582,7 +618,7 @@ func newMuxWithOverrides(upstreamAddr string, requestOverrides map[string]interf
 				return
 			}
 			var rewriteErr error
-			forwardBody, rewriteErr = applyRequestOverrides(reqJSON, requestOverrides)
+			forwardBody, rewriteErr = applyRequestOverrides(reqJSON, requestDefaults, requestOverrides)
 			if rewriteErr != nil {
 				http.Error(w, "could not rewrite JSON request body", http.StatusBadRequest)
 				return
@@ -646,7 +682,7 @@ func newMuxWithOverrides(upstreamAddr string, requestOverrides map[string]interf
 		switch {
 		case nativeGenerate:
 			// Handle streaming JSON response for generate/chat
-			buf := streamNative(w, respUp.Body, st, r.Method, r.URL.Path)
+			buf := streamNative(w, respUp.Body, st, sanitizeUTF8Responses, r.Method, r.URL.Path)
 
 			// Fix the JSON before parsing
 			bufData := fixDoneReason(buf.Bytes())
@@ -709,11 +745,13 @@ func newMuxWithOverrides(upstreamAddr string, requestOverrides map[string]interf
 			// an upstream error to a stream:true request is a plain JSON body.
 			st.streaming = strings.HasPrefix(respUp.Header.Get("Content-Type"), "text/event-stream")
 			if st.streaming {
-				streamOpenAI(w, respUp.Body, st, injectedUsage, r.Method, r.URL.Path)
+				streamOpenAI(w, respUp.Body, st, injectedUsage, sanitizeUTF8Responses, r.Method, r.URL.Path)
 			} else {
 				// Non-streaming /v1 always carries a usage object.
 				bodyData, _ := io.ReadAll(respUp.Body)
-				bodyData = sanitizeUTF8(bodyData)
+				if sanitizeUTF8Responses {
+					bodyData = sanitizeUTF8(bodyData)
+				}
 				logDebugBody("output", r.Method, r.URL.Path, bodyData)
 				w.Write(bodyData)
 				var res openAIResponse
@@ -754,13 +792,25 @@ func newMuxWithOverrides(upstreamAddr string, requestOverrides map[string]interf
 	return mux
 }
 
+// newMuxWithOverrides builds a proxy with only forceful overrides configured,
+// keeping the many existing override tests readable. Production construction
+// goes through newMuxWithConfig, which also carries defaults and the
+// sanitization switch.
+func newMuxWithOverrides(upstreamAddr string, requestOverrides map[string]interface{}) *http.ServeMux {
+	return newMuxWithConfig(upstreamAddr, map[string]interface{}{}, requestOverrides, true)
+}
+
 // newMux parses environment configuration once for direct proxy construction.
 func newMux(upstreamAddr string) *http.ServeMux {
 	overrides, err := parseRequestOverrides()
 	if err != nil {
 		panic(err)
 	}
-	return newMuxWithOverrides(upstreamAddr, overrides)
+	defaults, err := parseRequestDefaults()
+	if err != nil {
+		panic(err)
+	}
+	return newMuxWithConfig(upstreamAddr, defaults, overrides, sanitizeUTF8ResponsesEnabled())
 }
 
 func main() {
@@ -776,6 +826,7 @@ func main() {
 
 	log.Printf("Starting Ollama proxy sidecar, forwarding to %s", upstreamAddr)
 	log.Printf("Debug body logging enabled: %t", debugModeEnabled())
+	log.Printf("Response UTF-8 sanitization enabled: %t", sanitizeUTF8ResponsesEnabled())
 
 	// Optionally, initialize the loaded models gauge at startup
 	if resp, err := upstreamClient.Get(upstreamAddr + "/api/ps"); err == nil {
@@ -788,11 +839,15 @@ func main() {
 
 	requestOverrides, err := parseRequestOverrides()
 	if err != nil {
-		log.Fatalf("Invalid OLLAMA_PROXY_REQUEST_OVERRIDES: %v", err)
+		log.Fatalf("Invalid request override configuration: %v", err)
+	}
+	requestDefaults, err := parseRequestDefaults()
+	if err != nil {
+		log.Fatalf("Invalid request default configuration: %v", err)
 	}
 
 	// Start HTTP server
 	listenAddr := ":" + port
 	log.Printf("Listening on %s", listenAddr)
-	log.Fatal(http.ListenAndServe(listenAddr, newMuxWithOverrides(upstreamAddr, requestOverrides)))
+	log.Fatal(http.ListenAndServe(listenAddr, newMuxWithConfig(upstreamAddr, requestDefaults, requestOverrides, sanitizeUTF8ResponsesEnabled())))
 }

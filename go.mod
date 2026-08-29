@@ -1,4 +1,4 @@
-module github.com/NorskHelsenett/ollama-metrics/m/v2
+module github.com/NorskHelsenett/ollama-proxy/m/v2
 
 go 1.24.2
 

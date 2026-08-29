@@ -227,6 +227,14 @@ func newProxyWithOverrides(t *testing.T, overrides map[string]interface{}) (*htt
 	return proxy, stub
 }
 
+func newProxyWithConfig(t *testing.T, defaults, overrides map[string]interface{}, sanitizeUTF8Responses bool) (*httptest.Server, *stubUpstream) {
+	t.Helper()
+	stub := newStubUpstream(t)
+	proxy := httptest.NewServer(newMuxWithConfig(stub.URL, defaults, overrides, sanitizeUTF8Responses))
+	t.Cleanup(proxy.Close)
+	return proxy, stub
+}
+
 func TestRequestOverridesConfiguration(t *testing.T) {
 	t.Run("absent", func(t *testing.T) {
 		t.Setenv("OLLAMA_PROXY_REQUEST_OVERRIDES", "")
@@ -252,6 +260,14 @@ func TestRequestOverridesConfiguration(t *testing.T) {
 	}
 }
 
+func TestRequestDefaultsConfiguration(t *testing.T) {
+	t.Setenv("OLLAMA_PROXY_REQUEST_DEFAULTS", `{"reasoning_effort":"none"}`)
+	got, err := parseRequestDefaults()
+	if err != nil || got["reasoning_effort"] != "none" {
+		t.Fatalf("parseRequestDefaults() = %#v, %v", got, err)
+	}
+}
+
 func TestRequestOverridesClientValuesAndFields(t *testing.T) {
 	proxy, stub := newProxyWithOverrides(t, map[string]interface{}{
 		"reasoning_effort": "none",
@@ -274,6 +290,50 @@ func TestRequestOverridesClientValuesAndFields(t *testing.T) {
 	}
 	if up.header.Get("X-Test") != "preserve-me" {
 		t.Errorf("header was not preserved: %v", up.header)
+	}
+}
+
+func TestRequestDefaultsYieldToClientValues(t *testing.T) {
+	proxy, stub := newProxyWithConfig(t, map[string]interface{}{
+		"reasoning_effort": "none",
+		"temperature":      float64(0),
+	}, map[string]interface{}{}, true)
+	body := `{"model":"default-model","messages":[],"temperature":0.9}`
+	post(t, proxy, "/v1/chat/completions", body, nil)
+
+	var got map[string]interface{}
+	up := stub.lastRequest(t, "/v1/chat/completions")
+	if err := json.Unmarshal(up.body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["reasoning_effort"] != "none" {
+		t.Errorf("default missing from upstream request: %s", up.body)
+	}
+	if got["temperature"] != float64(0.9) {
+		t.Errorf("client value was overwritten by default: %s", up.body)
+	}
+}
+
+// TestRequestOverridesBeatDefaultsAndClient pins the precedence the two
+// variables exist to express: an override wins over everything, and a default
+// loses to anything the client sent.
+func TestRequestOverridesBeatDefaultsAndClient(t *testing.T) {
+	proxy, stub := newProxyWithConfig(t,
+		map[string]interface{}{"reasoning_effort": "none", "top_p": float64(0.1)},
+		map[string]interface{}{"reasoning_effort": "high"},
+		true)
+	post(t, proxy, "/v1/chat/completions", `{"model":"m","messages":[],"reasoning_effort":"low","top_p":0.9}`, nil)
+
+	var got map[string]interface{}
+	up := stub.lastRequest(t, "/v1/chat/completions")
+	if err := json.Unmarshal(up.body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["reasoning_effort"] != "high" {
+		t.Errorf("reasoning_effort = %v, want the override to win: %s", got["reasoning_effort"], up.body)
+	}
+	if got["top_p"] != float64(0.9) {
+		t.Errorf("top_p = %v, want the client value to beat the default: %s", got["top_p"], up.body)
 	}
 }
 
@@ -776,6 +836,28 @@ func TestSanitizeUTF8(t *testing.T) {
 	}
 }
 
+func TestSanitizeUTF8ResponsesEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"", true},
+		{"true", true},
+		{"false", false},
+		// A value ParseBool cannot read is a typo, not a request to turn the
+		// protection off, so it keeps the safe default.
+		{"yes", true},
+		{"invalid", true},
+	} {
+		t.Run(strconv.Quote(tc.value), func(t *testing.T) {
+			t.Setenv("OLLAMA_SANITIZE_UTF8_RESPONSE", tc.value)
+			if got := sanitizeUTF8ResponsesEnabled(); got != tc.want {
+				t.Errorf("sanitizeUTF8ResponsesEnabled() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestInvalidUTF8IsRepairedInFlight drives a real /api/chat stream whose upstream
 // emits a broken byte, and checks the client sees valid UTF-8 with the
 // surrounding characters untouched. Uses its own upstream rather than the shared
@@ -817,5 +899,30 @@ func TestInvalidUTF8IsRepairedInFlight(t *testing.T) {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("lost %q from the stream: %q", want, got)
 		}
+	}
+}
+
+func TestInvalidUTF8CanBeForwardedUnchanged(t *testing.T) {
+	body := []byte{'x', 0xc2, 'y'}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+	}))
+	defer upstream.Close()
+
+	proxy := httptest.NewServer(newMuxWithConfig(upstream.URL, map[string]interface{}{}, map[string]interface{}{}, false))
+	defer proxy.Close()
+
+	res, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"m","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer res.Body.Close()
+	got, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("body = %q, want unchanged invalid UTF-8 %q", got, body)
 	}
 }

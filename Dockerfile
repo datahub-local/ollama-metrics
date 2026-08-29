@@ -18,13 +18,13 @@ COPY main.go .
 
 # Build the application
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/ollama-metrics .
+    go build -trimpath -ldflags="-s -w" -o /out/ollama-proxy .
 
 # Final stage
 FROM scratch
 
 # Copy the binary from builder
-COPY --from=builder /out/ollama-metrics /ollama-metrics
+COPY --from=builder /out/ollama-proxy /ollama-proxy
 
 # Command to run
-ENTRYPOINT ["/ollama-metrics"]
+ENTRYPOINT ["/ollama-proxy"]

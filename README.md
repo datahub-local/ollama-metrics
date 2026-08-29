@@ -1,20 +1,23 @@
-# Ollama Metrics Sidecar
+# Ollama Proxy Sidecar
 
-A lightweight metrics collector and proxy for [Ollama](https://ollama.com/) that exposes Prometheus metrics for monitoring your LLM deployments.
+A lightweight sidecar proxy for [Ollama](https://ollama.com/) that shapes outgoing **requests**, repairs incoming **responses**, and exposes Prometheus **metrics** for monitoring your LLM deployments.
 
 ![cover image](.docs/cover.png)
 
 ## Overview
 
-Ollama Metrics Sidecar sits between your applications and Ollama, collecting metrics on:
+Ollama Proxy Sidecar sits between your applications and Ollama, forwarding every
+request upstream and doing three things along the way:
 
-- Token usage (prompt and generated tokens)
-- Request duration
-- Inference speed (time per token, time to first token)
-- Model memory usage
-- Model loading status
+- **Request** - apply configured defaults and overrides before the request
+  reaches Ollama.
+- **Response** - repair invalid UTF-8 and keep client-visible output identical
+  to Ollama's own.
+- **Metrics** - expose Prometheus metrics on tokens, latency and loaded models.
 
-It acts as a transparent proxy, forwarding all requests to Ollama while collecting metrics without affecting normal operation.
+Apart from the request fields you deliberately configure, it is transparent:
+clients see the response Ollama would have sent, streaming included. Ollama
+itself needs no modification.
 
 Token usage is accounted for on both of Ollama's dialects: the native
 `/api/generate` and `/api/chat` endpoints, and the OpenAI-compatible
@@ -23,29 +26,77 @@ proxied through unchanged, with request duration recorded.
 
 ## Features
 
-- Zero configuration required - works out of the box
-- No modification to Ollama needed
-- Collects detailed metrics on model usage and performance
-- Prometheus compatible metrics endpoint
-- Comes with pre-built Grafana dashboard
+The three jobs are independent, and all have safe defaults - the sidecar works
+out of the box without setting a single variable.
+
+### Request
+
+Applied to `POST /v1/chat/completions` before the body is forwarded upstream.
+
+- **Defaults** (`OLLAMA_PROXY_REQUEST_DEFAULTS`) - fields merged *under* the
+  client's body, so any client can opt out by sending its own value. Use this
+  for a fleet-wide preference.
+- **Overrides** (`OLLAMA_PROXY_REQUEST_OVERRIDES`) - fields merged *over* the
+  client's body, so the configured value always wins. Use this for a value
+  clients must not change.
+- **Usage injection** - streaming `/v1` requests get
+  `stream_options.include_usage` added when the client did not set it. Ollama
+  otherwise reports no token counts on that dialect, so this is what makes
+  `/v1` token metrics possible at all.
+
+Precedence when the same field is set in more than one place:
+**overrides > client request > defaults**.
+
+### Response
+
+- **UTF-8 repair** (`OLLAMA_SANITIZE_UTF8_RESPONSE`, default `true`) - invalid
+  byte sequences from the model are replaced with U+FFFD. A consumer that puts
+  the reply into protobuf/gRPC drops the entire message over a single bad byte;
+  repairing it costs one character. Set to `false` to forward bytes untouched.
+- **Client output unchanged** - the usage chunk the sidecar asked for on the
+  client's behalf is withheld on the way back, so the stream a client sees is
+  the one it would have got talking to Ollama directly. A client that requested
+  usage itself has its chunk forwarded.
+- **Streaming preserved** - responses are relayed and flushed chunk by chunk,
+  never buffered to completion.
+
+### Metrics
+
+- Prometheus-compatible endpoint at `/metrics`.
+- Token usage, request duration, time per token, time to first token, and
+  loaded-model and RAM gauges - see [Available Metrics](#available-metrics).
+- Recorded across both API dialects, with per-model and per-endpoint labels.
+- Ships with a pre-built Grafana dashboard.
 
 ## Usage
 
 ### Environment Variables
 
-- `OLLAMA_HOST` - Ollama host address (default: `http://localhost:11434`)
-- `PORT` - Port to run the metrics server on (default: `8080`)
-- `DEBUG_MODE` - Set to `true` to log request input and response output bodies (default: disabled)
-- `OLLAMA_PROXY_REQUEST_OVERRIDES` - JSON object merged over `POST /v1/chat/completions` requests (default: `{}`); configured values override client values.
+| Variable | Default | Applies to | Description |
+| --- | --- | --- | --- |
+| `OLLAMA_HOST` | `http://localhost:11434` | - | Upstream Ollama address |
+| `PORT` | `8080` | - | Port the sidecar listens on |
+| `DEBUG_MODE` | `false` | - | Log request input and response output bodies |
+| `OLLAMA_PROXY_REQUEST_DEFAULTS` | `{}` | Request | JSON object merged *under* `POST /v1/chat/completions`; client values take precedence, so each client can opt out |
+| `OLLAMA_PROXY_REQUEST_OVERRIDES` | `{}` | Request | JSON object merged *over* `POST /v1/chat/completions`; configured values win over client values |
+| `OLLAMA_SANITIZE_UTF8_RESPONSE` | `true` | Response | Replace invalid UTF-8 in upstream responses with U+FFFD; `false` forwards response bytes unchanged |
+
+When the same field is set in more than one place, precedence is
+**overrides > client request > defaults**.
+
+`OLLAMA_SANITIZE_UTF8_RESPONSE` only accepts what Go's `ParseBool` reads
+(`true`/`false`, `1`/`0`, `t`/`f`). Anything else is treated as a typo and logged
+as a warning, leaving sanitization enabled - the protection is never switched
+off by accident.
 
 ### Docker
 
 ```bash
-docker run -d --name ollama-metrics \
+docker run -d --name ollama-proxy \
   -e OLLAMA_HOST=http://ollama:11434 \
-  -e 'OLLAMA_PROXY_REQUEST_OVERRIDES={"reasoning_effort":"none"}' \
+  -e 'OLLAMA_PROXY_REQUEST_DEFAULTS={"reasoning_effort":"none"}' \
   -p 8080:8080 \
-  ghcr.io/norskhelsenett/ollama-metrics:latest
+  ghcr.io/norskhelsenett/ollama-proxy:latest
 ```
 
 ### Local Development
@@ -55,8 +106,8 @@ docker run -d --name ollama-metrics \
 go run main.go
 
 # Build and run
-go build -o ollama-metrics
-./ollama-metrics
+go build -o ollama-proxy
+./ollama-proxy
 ```
 
 ## Metrics
@@ -126,14 +177,14 @@ Access Grafana at http://localhost:3000 (default credentials: admin/admin)
 
 ```bash
 # Clone the repository
-git clone https://github.com/NorskHelsenett/ollama-metrics.git
-cd ollama-metrics
+git clone https://github.com/NorskHelsenett/ollama-proxy.git
+cd ollama-proxy
 
 # Build
-docker build -t ollama-metrics .
+docker build -t ollama-proxy .
 
 # Or build locally
-go build -o ollama-metrics
+go build -o ollama-proxy
 
 # Run the tests (they stand up a stub Ollama; no cluster or GPU needed)
 go test ./...

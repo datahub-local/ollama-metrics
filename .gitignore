@@ -3,4 +3,4 @@ __debug_**
 # Build artifacts: `go build ./...` names the binary after the module path's
 # last element ("m"), `go build -o` after the flag.
 /m
-/ollama-metrics
+/ollama-proxy
