@@ -1,6 +1,6 @@
 # Build stage. Runs on the build host's own architecture and cross-compiles for
 # the target, which is much faster than emulating the target under QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
