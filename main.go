@@ -330,6 +330,81 @@ func sanitizeUTF8ResponsesEnabled() bool {
 	return enabled
 }
 
+// promoteReasoningToContentEnabled reports whether an assistant message that
+// carries reasoning but no content should have the reasoning promoted into
+// content. It defaults to true for the same reason UTF-8 repair does: the
+// alternative is the caller receiving nothing at all. An unparseable value
+// keeps the default rather than silently switching the repair off.
+func promoteReasoningToContentEnabled() bool {
+	raw := os.Getenv("OLLAMA_PROMOTE_REASONING_TO_CONTENT")
+	if raw == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		log.Printf("WARNING: ignoring unparseable OLLAMA_PROMOTE_REASONING_TO_CONTENT=%q; keeping promotion enabled", raw)
+		return true
+	}
+	return enabled
+}
+
+// promoteReasoningToContent rewrites a non-streaming /v1 chat completion whose
+// assistant message has empty content but non-empty reasoning, copying the
+// reasoning into content. It returns the body to send and how many choices it
+// rewrote.
+//
+// A thinking model routinely spends its final turn entirely in `reasoning` and
+// leaves `content` empty. A client reading only `content` then gets a
+// successful, well-formed response carrying nothing and reports no error - the
+// answer was produced and thrown away. Delivering it is strictly better.
+//
+// Two guards keep this off a healthy response. A choice carrying `tool_calls`
+// is legitimately content-empty - that is a tool-call turn, not a lost answer -
+// and is left alone. And `reasoning` is copied rather than moved, so a client
+// reading both fields still sees exactly what the model sent.
+func promoteReasoningToContent(body []byte) ([]byte, int) {
+	parsed := parseRequestJSON(body)
+	if parsed == nil {
+		return body, 0
+	}
+	choices, ok := parsed["choices"].([]interface{})
+	if !ok {
+		return body, 0
+	}
+	promoted := 0
+	for _, choice := range choices {
+		entry, ok := choice.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		msg, ok := entry["message"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if calls, ok := msg["tool_calls"].([]interface{}); ok && len(calls) > 0 {
+			continue
+		}
+		if content, _ := msg["content"].(string); strings.TrimSpace(content) != "" {
+			continue
+		}
+		reasoning, _ := msg["reasoning"].(string)
+		if strings.TrimSpace(reasoning) == "" {
+			continue
+		}
+		msg["content"] = reasoning
+		promoted++
+	}
+	if promoted == 0 {
+		return body, 0
+	}
+	rewritten, err := json.Marshal(parsed)
+	if err != nil {
+		log.Printf("WARNING: could not promote reasoning to content: %v", err)
+		return body, 0
+	}
+	return rewritten, promoted
+}
+
 // applyRequestOverrides merges defaults under client values and overrides over
 // them, while preserving json.Number values when the rewritten body is
 // marshalled.
@@ -569,9 +644,20 @@ func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropI
 	}
 }
 
+// proxyConfig carries the process-wide switches the handler needs. It is a
+// struct rather than a longer parameter list because the switches are all
+// bools of the same type: positional bools at a call site say nothing about
+// which repair they turn off.
+type proxyConfig struct {
+	requestDefaults       map[string]interface{}
+	requestOverrides      map[string]interface{}
+	sanitizeUTF8Responses bool
+	promoteReasoning      bool
+}
+
 // newMuxWithConfig builds the sidecar's handlers: /metrics, and a proxy for
 // everything else that forwards to upstreamAddr while accounting for token usage.
-func newMuxWithConfig(upstreamAddr string, requestDefaults, requestOverrides map[string]interface{}, sanitizeUTF8Responses bool) *http.ServeMux {
+func newMuxWithConfig(upstreamAddr string, cfg proxyConfig) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Custom metrics handler that refreshes model data before serving metrics
@@ -618,7 +704,7 @@ func newMuxWithConfig(upstreamAddr string, requestDefaults, requestOverrides map
 				return
 			}
 			var rewriteErr error
-			forwardBody, rewriteErr = applyRequestOverrides(reqJSON, requestDefaults, requestOverrides)
+			forwardBody, rewriteErr = applyRequestOverrides(reqJSON, cfg.requestDefaults, cfg.requestOverrides)
 			if rewriteErr != nil {
 				http.Error(w, "could not rewrite JSON request body", http.StatusBadRequest)
 				return
@@ -682,7 +768,7 @@ func newMuxWithConfig(upstreamAddr string, requestDefaults, requestOverrides map
 		switch {
 		case nativeGenerate:
 			// Handle streaming JSON response for generate/chat
-			buf := streamNative(w, respUp.Body, st, sanitizeUTF8Responses, r.Method, r.URL.Path)
+			buf := streamNative(w, respUp.Body, st, cfg.sanitizeUTF8Responses, r.Method, r.URL.Path)
 
 			// Fix the JSON before parsing
 			bufData := fixDoneReason(buf.Bytes())
@@ -745,12 +831,22 @@ func newMuxWithConfig(upstreamAddr string, requestDefaults, requestOverrides map
 			// an upstream error to a stream:true request is a plain JSON body.
 			st.streaming = strings.HasPrefix(respUp.Header.Get("Content-Type"), "text/event-stream")
 			if st.streaming {
-				streamOpenAI(w, respUp.Body, st, injectedUsage, sanitizeUTF8Responses, r.Method, r.URL.Path)
+				streamOpenAI(w, respUp.Body, st, injectedUsage, cfg.sanitizeUTF8Responses, r.Method, r.URL.Path)
 			} else {
 				// Non-streaming /v1 always carries a usage object.
 				bodyData, _ := io.ReadAll(respUp.Body)
-				if sanitizeUTF8Responses {
+				if cfg.sanitizeUTF8Responses {
 					bodyData = sanitizeUTF8(bodyData)
+				}
+				// Promote before logging and writing, so the debug log shows
+				// what the client actually received. Streaming is not handled:
+				// deciding that content stayed empty means holding the whole
+				// stream, which would cost the chunk-by-chunk relay.
+				if cfg.promoteReasoning {
+					if promotedBody, n := promoteReasoningToContent(bodyData); n > 0 {
+						log.Printf("promoted reasoning to empty content in %d choice(s)", n)
+						bodyData = promotedBody
+					}
 				}
 				logDebugBody("output", r.Method, r.URL.Path, bodyData)
 				w.Write(bodyData)
@@ -797,7 +893,12 @@ func newMuxWithConfig(upstreamAddr string, requestDefaults, requestOverrides map
 // goes through newMuxWithConfig, which also carries defaults and the
 // sanitization switch.
 func newMuxWithOverrides(upstreamAddr string, requestOverrides map[string]interface{}) *http.ServeMux {
-	return newMuxWithConfig(upstreamAddr, map[string]interface{}{}, requestOverrides, true)
+	return newMuxWithConfig(upstreamAddr, proxyConfig{
+		requestDefaults:       map[string]interface{}{},
+		requestOverrides:      requestOverrides,
+		sanitizeUTF8Responses: true,
+		promoteReasoning:      true,
+	})
 }
 
 // newMux parses environment configuration once for direct proxy construction.
@@ -810,7 +911,12 @@ func newMux(upstreamAddr string) *http.ServeMux {
 	if err != nil {
 		panic(err)
 	}
-	return newMuxWithConfig(upstreamAddr, defaults, overrides, sanitizeUTF8ResponsesEnabled())
+	return newMuxWithConfig(upstreamAddr, proxyConfig{
+		requestDefaults:       defaults,
+		requestOverrides:      overrides,
+		sanitizeUTF8Responses: sanitizeUTF8ResponsesEnabled(),
+		promoteReasoning:      promoteReasoningToContentEnabled(),
+	})
 }
 
 func main() {
@@ -849,5 +955,10 @@ func main() {
 	// Start HTTP server
 	listenAddr := ":" + port
 	log.Printf("Listening on %s", listenAddr)
-	log.Fatal(http.ListenAndServe(listenAddr, newMuxWithConfig(upstreamAddr, requestDefaults, requestOverrides, sanitizeUTF8ResponsesEnabled())))
+	log.Fatal(http.ListenAndServe(listenAddr, newMuxWithConfig(upstreamAddr, proxyConfig{
+		requestDefaults:       requestDefaults,
+		requestOverrides:      requestOverrides,
+		sanitizeUTF8Responses: sanitizeUTF8ResponsesEnabled(),
+		promoteReasoning:      promoteReasoningToContentEnabled(),
+	})))
 }

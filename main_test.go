@@ -230,7 +230,12 @@ func newProxyWithOverrides(t *testing.T, overrides map[string]interface{}) (*htt
 func newProxyWithConfig(t *testing.T, defaults, overrides map[string]interface{}, sanitizeUTF8Responses bool) (*httptest.Server, *stubUpstream) {
 	t.Helper()
 	stub := newStubUpstream(t)
-	proxy := httptest.NewServer(newMuxWithConfig(stub.URL, defaults, overrides, sanitizeUTF8Responses))
+	proxy := httptest.NewServer(newMuxWithConfig(stub.URL, proxyConfig{
+		requestDefaults:       defaults,
+		requestOverrides:      overrides,
+		sanitizeUTF8Responses: sanitizeUTF8Responses,
+		promoteReasoning:      true,
+	}))
 	t.Cleanup(proxy.Close)
 	return proxy, stub
 }
@@ -910,7 +915,12 @@ func TestInvalidUTF8CanBeForwardedUnchanged(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy := httptest.NewServer(newMuxWithConfig(upstream.URL, map[string]interface{}{}, map[string]interface{}{}, false))
+	proxy := httptest.NewServer(newMuxWithConfig(upstream.URL, proxyConfig{
+		requestDefaults:       map[string]interface{}{},
+		requestOverrides:      map[string]interface{}{},
+		sanitizeUTF8Responses: false,
+		promoteReasoning:      true,
+	}))
 	defer proxy.Close()
 
 	res, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"m","messages":[]}`))
@@ -924,5 +934,159 @@ func TestInvalidUTF8CanBeForwardedUnchanged(t *testing.T) {
 	}
 	if !bytes.Equal(got, body) {
 		t.Errorf("body = %q, want unchanged invalid UTF-8 %q", got, body)
+	}
+}
+
+// TestPromoteReasoningToContent pins the repair against the shape that lost a
+// scheduled report: qwen3.5:4b ended its terminal turn with a complete analysis
+// in "reasoning", an empty "content" and finish_reason "stop", and the caller,
+// which reads only content, delivered nothing while reporting success.
+func TestPromoteReasoningToContent(t *testing.T) {
+	body := []byte(`{"id":"chatcmpl-530","object":"chat.completion","model":"qwen3.5:4b",` +
+		`"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant",` +
+		`"content":"","reasoning":"Let me analyze the results: Postgres is healthy."}}],` +
+		`"usage":{"prompt_tokens":5541,"completion_tokens":266,"total_tokens":5807}}`)
+
+	got, promoted := promoteReasoningToContent(body)
+	if promoted != 1 {
+		t.Fatalf("promoted = %d, want 1", promoted)
+	}
+	var res struct {
+		Usage   map[string]json.Number `json:"usage"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content   string `json:"content"`
+				Reasoning string `json:"reasoning"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(got, &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	want := "Let me analyze the results: Postgres is healthy."
+	if res.Choices[0].Message.Content != want {
+		t.Errorf("content = %q, want %q", res.Choices[0].Message.Content, want)
+	}
+	// Copied, not moved: a client reading both fields still sees what was sent.
+	if res.Choices[0].Message.Reasoning != want {
+		t.Errorf("reasoning = %q, want it left in place", res.Choices[0].Message.Reasoning)
+	}
+	if res.Choices[0].FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want stop", res.Choices[0].FinishReason)
+	}
+	// Integer literals must survive the re-marshal.
+	if v := res.Usage["total_tokens"].String(); v != "5807" {
+		t.Errorf("total_tokens = %s, want 5807", v)
+	}
+}
+
+// TestPromoteReasoningLeavesToolCallTurnsAlone is the guard that matters most:
+// every intermediate turn of an agent loop has empty content by design, and
+// rewriting one would put prose where the caller expects a tool call.
+func TestPromoteReasoningLeavesToolCallTurnsAlone(t *testing.T) {
+	body := []byte(`{"object":"chat.completion","choices":[{"message":{"role":"assistant",` +
+		`"content":"","reasoning":"I should call the health tool.",` +
+		`"tool_calls":[{"id":"call_1","type":"function","function":{"name":"health","arguments":"{}"}}]}}]}`)
+
+	got, promoted := promoteReasoningToContent(body)
+	if promoted != 0 {
+		t.Fatalf("promoted = %d, want 0 for a tool-call turn", promoted)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("body was rewritten:\n got %s\nwant %s", got, body)
+	}
+}
+
+// TestPromoteReasoningSkipsHealthyResponses covers the cases that must stay
+// byte-identical: real content present, and no reasoning to promote.
+func TestPromoteReasoningSkipsHealthyResponses(t *testing.T) {
+	cases := map[string]string{
+		"content present":   `{"choices":[{"message":{"content":"## Headline\nAll clear","reasoning":"thinking"}}]}`,
+		"no reasoning":      `{"choices":[{"message":{"content":""}}]}`,
+		"whitespace only":   `{"choices":[{"message":{"content":"","reasoning":"   "}}]}`,
+		"not a completion":  `{"models":[{"name":"m"}]}`,
+		"malformed":         `{"choices":`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, promoted := promoteReasoningToContent([]byte(body))
+			if promoted != 0 {
+				t.Fatalf("promoted = %d, want 0", promoted)
+			}
+			if string(got) != body {
+				t.Errorf("body = %s, want it unchanged", got)
+			}
+		})
+	}
+}
+
+// TestPromoteReasoningToContentEnabled pins the default-on behaviour and the
+// refusal to disable the repair on a typo.
+func TestPromoteReasoningToContentEnabled(t *testing.T) {
+	cases := []struct {
+		raw  string
+		set  bool
+		want bool
+	}{
+		{set: false, want: true},
+		{raw: "true", set: true, want: true},
+		{raw: "false", set: true, want: false},
+		{raw: "0", set: true, want: false},
+		{raw: "yes-please", set: true, want: true},
+	}
+	for _, tc := range cases {
+		if tc.set {
+			t.Setenv("OLLAMA_PROMOTE_REASONING_TO_CONTENT", tc.raw)
+		} else {
+			os.Unsetenv("OLLAMA_PROMOTE_REASONING_TO_CONTENT")
+		}
+		if got := promoteReasoningToContentEnabled(); got != tc.want {
+			t.Errorf("OLLAMA_PROMOTE_REASONING_TO_CONTENT=%q: got %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+}
+
+// TestPromotedResponseReachesTheClient exercises the whole proxy path, since
+// the promotion has to survive header copying and the metrics parse.
+func TestPromotedResponseReachesTheClient(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"chat.completion","model":"qwen3.5:4b",`+
+			`"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"","reasoning":"The report."}}],`+
+			`"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}`)
+	}))
+	defer upstream.Close()
+
+	proxy := httptest.NewServer(newMuxWithConfig(upstream.URL, proxyConfig{
+		requestDefaults:       map[string]interface{}{},
+		requestOverrides:      map[string]interface{}{},
+		sanitizeUTF8Responses: true,
+		promoteReasoning:      true,
+	}))
+	defer proxy.Close()
+
+	res, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"qwen3.5:4b","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer res.Body.Close()
+	got, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(got, &parsed); err != nil {
+		t.Fatalf("unmarshal %s: %v", got, err)
+	}
+	if parsed.Choices[0].Message.Content != "The report." {
+		t.Errorf("content = %q, want %q", parsed.Choices[0].Message.Content, "The report.")
 	}
 }
