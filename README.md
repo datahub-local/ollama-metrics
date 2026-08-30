@@ -53,6 +53,16 @@ Precedence when the same field is set in more than one place:
   byte sequences from the model are replaced with U+FFFD. A consumer that puts
   the reply into protobuf/gRPC drops the entire message over a single bad byte;
   repairing it costs one character. Set to `false` to forward bytes untouched.
+- **Reasoning promotion** (`OLLAMA_PROMOTE_REASONING_TO_CONTENT`, default
+  `true`) - a non-streaming `/v1` reply whose assistant message has empty
+  `content` but non-empty `reasoning` gets the reasoning copied into `content`.
+  A thinking model routinely spends its final turn entirely in `reasoning`, and
+  a client reading only `content` then gets a successful, well-formed response
+  carrying nothing. Choices with `tool_calls` are left alone, and `reasoning` is
+  copied rather than moved, so a client reading both fields sees exactly what
+  the model sent. Streaming responses are not touched - deciding that content
+  stayed empty would mean buffering the whole stream. Set to `false` to forward
+  the empty content as-is.
 - **Client output unchanged** - the usage chunk the sidecar asked for on the
   client's behalf is withheld on the way back, so the stream a client sees is
   the one it would have got talking to Ollama directly. A client that requested
@@ -80,14 +90,21 @@ Precedence when the same field is set in more than one place:
 | `OLLAMA_PROXY_REQUEST_DEFAULTS` | `{}` | Request | JSON object merged *under* `POST /v1/chat/completions`; client values take precedence, so each client can opt out |
 | `OLLAMA_PROXY_REQUEST_OVERRIDES` | `{}` | Request | JSON object merged *over* `POST /v1/chat/completions`; configured values win over client values |
 | `OLLAMA_SANITIZE_UTF8_RESPONSE` | `true` | Response | Replace invalid UTF-8 in upstream responses with U+FFFD; `false` forwards response bytes unchanged |
+| `OLLAMA_PROMOTE_REASONING_TO_CONTENT` | `true` | Response | Copy `reasoning` into an empty `content` on non-streaming `/v1/chat/completions`; `false` leaves the empty content alone |
 
 When the same field is set in more than one place, precedence is
 **overrides > client request > defaults**.
 
-`OLLAMA_SANITIZE_UTF8_RESPONSE` only accepts what Go's `ParseBool` reads
-(`true`/`false`, `1`/`0`, `t`/`f`). Anything else is treated as a typo and logged
-as a warning, leaving sanitization enabled - the protection is never switched
-off by accident.
+`OLLAMA_SANITIZE_UTF8_RESPONSE` and `OLLAMA_PROMOTE_REASONING_TO_CONTENT` only
+accept what Go's `ParseBool` reads (`true`/`false`, `1`/`0`, `t`/`f`). Anything
+else is treated as a typo and logged as a warning, leaving the repair enabled -
+the protection is never switched off by accident.
+
+Reasoning promotion is a floor, not a fix. What it delivers is the model's chain
+of thought, so it will not follow whatever output contract the caller asked for:
+it turns a silently dropped answer into a badly formatted one, which is strictly
+better and still worth fixing in the prompt. The higher the thinking level, the
+longer that promoted text is and the less it resembles the requested shape.
 
 ### Docker
 
